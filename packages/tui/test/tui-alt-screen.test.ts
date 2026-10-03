@@ -1,6 +1,10 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import { AltScreenSearchComponent, findAltScreenSearchMatches } from "../src/alt-screen-search.ts";
+import {
+	AltScreenSearchComponent,
+	AltScreenSearchIndex,
+	findAltScreenSearchMatches,
+} from "../src/alt-screen-search.ts";
 import { HStack } from "../src/components/h-stack.ts";
 import { Image } from "../src/components/image.ts";
 import { MouseRegion } from "../src/components/mouse-region.ts";
@@ -134,7 +138,51 @@ describe("TuiAltScreen", () => {
 		tui.stop();
 	});
 
-	it("leaves the scrollbar clickable when the jump-to-end indicator spans the transcript", async () => {
+	it("keeps the jump-to-end indicator centered as the auto scrollbar hides and reappears", async () => {
+		// Regression test for #9136: auto scrollbar visibility must not move the indicator.
+		const terminal = new VirtualTerminal(80, 6);
+		const label = " ↓ Jump to latest message · End ";
+		const tui = new TuiAltScreen(terminal, undefined, undefined, {
+			scrollToEndIndicator: () => label,
+		});
+		const transcript = new ScrollView(
+			new Text(Array.from({ length: 20 }, (_, index) => `line ${index + 1}`).join("\n"), 0, 0),
+			{ follow: "end", primary: true, scrollbar: "auto", scrollbarHideDelayMs: 0 },
+		);
+		tui.setLayoutRoot(transcript);
+		tui.start();
+		try {
+			await terminal.waitForRender();
+
+			// Scrolling over the track keeps the scrollbar visible until the pointer leaves.
+			terminal.sendInput("\x1b[<64;80;1M");
+			await terminal.waitForRender();
+			assert.strictEqual(transcript.isScrollbarVisible, true);
+			assert.strictEqual(transcript.isFollowingEnd, false);
+			const scrollTop = transcript.scrollTop;
+			const visibleColumn = terminal.getViewport()[5].indexOf(label);
+
+			// Leaving the track lets the auto-hide timer expire without changing the content.
+			terminal.sendInput("\x1b[<35;79;1M");
+			await terminal.waitForRender();
+			assert.strictEqual(transcript.isScrollbarVisible, false);
+			assert.strictEqual(transcript.scrollTop, scrollTop);
+			const hiddenColumn = terminal.getViewport()[5].indexOf(label);
+
+			terminal.sendInput("\x1b[<35;80;1M");
+			await terminal.waitForRender();
+			assert.strictEqual(transcript.isScrollbarVisible, true);
+			assert.strictEqual(transcript.scrollTop, scrollTop);
+			const revealedColumn = terminal.getViewport()[5].indexOf(label);
+
+			assert.deepStrictEqual([visibleColumn, hiddenColumn, revealedColumn], [24, 24, 24]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("leaves the scrollbar visible and clickable when the jump-to-end indicator spans the transcript", async () => {
+		// Regression coverage for #9136: centering must not paint or capture clicks over the scrollbar.
 		const terminal = new VirtualTerminal(30, 6);
 		const tui = new TuiAltScreen(terminal, undefined, undefined, {
 			scrollToEndIndicator: () => "↓".repeat(30),
@@ -157,6 +205,7 @@ describe("TuiAltScreen", () => {
 		assert.strictEqual(transcript.isFollowingEnd, false);
 
 		// The indicator must not intercept a press on the scrollbar's last column.
+		assert.strictEqual(terminal.getViewport()[3], `${"↓".repeat(29)}┃`);
 		terminal.sendInput("\x1b[<0;30;4M");
 		terminal.sendInput("\x1b[<0;30;4m");
 		await terminal.waitForRender();
@@ -266,6 +315,22 @@ describe("TuiAltScreen", () => {
 			terminal.getViewport().map((line) => line.trimEnd()),
 			["a4        b3", "a5        b4", "a6        b5", "a7        b6"],
 		);
+		tui.stop();
+	});
+
+	it("scrolls faster while Alt is held during wheel input", async () => {
+		const terminal = new VirtualTerminal(20, 4);
+		const tui = new TuiAltScreen(terminal);
+		const text = new Text(Array.from({ length: 12 }, (_, index) => `line ${index + 1}`).join("\n"), 0, 0);
+		tui.addChild(text);
+		tui.start();
+		await terminal.waitForRender();
+		assert.strictEqual(tui.viewportTop, 8);
+
+		// Alt modifier sets bit 8 on the wheel button (72 = 64 + 8).
+		terminal.sendInput("\x1b[<72;1;1M");
+		await terminal.waitForRender();
+		assert.strictEqual(tui.viewportTop, 3);
 		tui.stop();
 	});
 
@@ -439,6 +504,31 @@ describe("TuiAltScreen", () => {
 		tui.stop();
 	});
 
+	// #9758: wheel line counts can change at runtime; Alt keeps its multiplier.
+	it("applies runtime wheel line count updates", async () => {
+		const terminal = new VirtualTerminal(20, 4);
+		const tui = new TuiAltScreen(terminal, undefined, undefined, { wheelScrollLines: 3 });
+		const deltas: Array<number | undefined> = [];
+		tui.addChild(
+			new MouseRegion(new Text("wheel target", 0, 0), (event) => {
+				if (event.type !== "wheel") return undefined;
+				deltas.push(event.wheelDelta);
+				return { handled: true };
+			}),
+		);
+		tui.start();
+		try {
+			await terminal.waitForRender();
+			terminal.sendInput("\x1b[<64;1;1M");
+			tui.setWheelScrollLines(2);
+			terminal.sendInput("\x1b[<65;1;1M");
+			terminal.sendInput("\x1b[<72;1;1M");
+			assert.deepStrictEqual(deltas, [-3, 2, -10]);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("chains unused wheel delta to an outer scroll view", async () => {
 		const terminal = new VirtualTerminal(20, 4);
 		const tui = new TuiAltScreen(terminal, undefined, undefined, { wheelScrollLines: 3 });
@@ -512,6 +602,38 @@ describe("TuiAltScreen", () => {
 				],
 			},
 		]);
+	});
+
+	it("maps normalized ASCII and Unicode search matches back to rendered columns", () => {
+		assert.deepStrictEqual(findAltScreenSearchMatches(["\x1b[31mfoo  bar\x1b[0m", "A界🙂éZ"], "oo   bar\nA界🙂é"), [
+			{
+				segments: [
+					{ row: 0, startCol: 1, endCol: 3 },
+					{ row: 0, startCol: 5, endCol: 8 },
+					{ row: 1, startCol: 0, endCol: 6 },
+				],
+			},
+		]);
+	});
+
+	it("reuses indexed transcript matches until the query or rendered lines change", () => {
+		const index = new AltScreenSearchIndex();
+		const initial = index.search(["alpha needle", "omega"], "needle");
+		assert.strictEqual(initial.changed, true);
+		assert.strictEqual(initial.matches.length, 1);
+
+		const cached = index.search(["alpha needle", "omega"], "needle");
+		assert.strictEqual(cached.changed, false);
+		assert.strictEqual(cached.matches, initial.matches);
+
+		const changedQuery = index.search(["alpha needle", "omega"], "omega");
+		assert.strictEqual(changedQuery.changed, true);
+		assert.notStrictEqual(changedQuery.matches, initial.matches);
+		assert.deepStrictEqual(changedQuery.matches[0]?.segments, [{ row: 1, startCol: 0, endCol: 5 }]);
+
+		const changedLines = index.search(["alpha needle", "no match"], "omega");
+		assert.strictEqual(changedLines.changed, true);
+		assert.deepStrictEqual(changedLines.matches, []);
 	});
 
 	it("renders transcript search with a muted placeholder and right-aligned controls", () => {
@@ -940,6 +1062,47 @@ describe("TuiAltScreen", () => {
 		tui.stop();
 	});
 
+	it("redraws WezTerm Kitty images after writes to covered rows", async () => {
+		// Regression test for #10319: a scrollbar update below an unchanged image anchor erased its cells.
+		const weztermPane = process.env.WEZTERM_PANE;
+		let tui: TuiAltScreen | undefined;
+		process.env.WEZTERM_PANE = "1";
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+		try {
+			const terminal = new RecordingTerminal(20, 4);
+			const imageId = 10319;
+			const imageLine = encodeKitty("AAAA", { columns: 2, rows: 3, imageId, moveCursor: false });
+			registerKittyImageMetadata({ imageId, columns: 2, rows: 3, widthPx: 100, heightPx: 100 });
+			let coveredLine = "";
+			tui = new TuiAltScreen(terminal);
+			tui.setLayoutRoot({
+				render: () => [imageLine, coveredLine, "", "after"],
+				invalidate: () => {},
+			});
+			tui.start();
+			await terminal.waitForRender();
+			const eventCount = terminal.events.length;
+
+			coveredLine = "changed";
+			tui.requestRender();
+			await terminal.waitForRender();
+			const redrawWrites = terminal.events
+				.slice(eventCount)
+				.filter((event): event is { type: "write"; data: string } => event.type === "write")
+				.map((event) => event.data)
+				.join("");
+			const placementIndex = redrawWrites.indexOf("\x1b_Ga=p,q=2");
+			assert.ok(redrawWrites.includes("\x1b_Ga=d,d=a,q=2\x1b\\"));
+			assert.ok(placementIndex > redrawWrites.indexOf("changed"));
+			assert.ok(!redrawWrites.includes("\x1b_Ga=T"));
+		} finally {
+			tui?.stop();
+			resetCapabilitiesCache();
+			if (weztermPane === undefined) delete process.env.WEZTERM_PANE;
+			else process.env.WEZTERM_PANE = weztermPane;
+		}
+	});
+
 	it("reuses moved Kitty images without dropping HStack siblings", async () => {
 		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
 		try {
@@ -1296,6 +1459,36 @@ describe("TuiAltScreen", () => {
 			"must not emit OSC 52 when a copySelection handler is provided",
 		);
 
+		tui.stop();
+	});
+
+	it("flashes a specific error returned by the injected copySelection handler", async () => {
+		// Regression test for #9618.
+		const terminal = new RecordingTerminal(80, 4);
+		const tui = new TuiAltScreen(terminal, undefined, undefined, {
+			copyOnSelect: false,
+			copySelection: async () => "Clipboard unavailable: install wl-clipboard",
+		});
+		let flashDuration: number | undefined;
+		const flash = tui.flash.bind(tui);
+		tui.flash = (message, durationMs) => {
+			flashDuration = durationMs;
+			flash(message, durationMs);
+		};
+		tui.addChild(new Text("alpha\nbeta\ngamma\ndelta", 0, 0));
+		tui.start();
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;1;1M");
+		terminal.sendInput("\x1b[<32;4;2M");
+		terminal.sendInput("\x1b[<0;4;2m");
+		await terminal.waitForRender();
+		assert.strictEqual(await tui.copyActiveSelectionToClipboard(), false);
+		await terminal.waitForRender();
+
+		assert.ok(terminal.getViewport().some((line) => line.includes("Clipboard unavailable: install wl-clipboard")));
+		assert.ok(terminal.getViewport().every((line) => !line.includes("Copy failed")));
+		assert.strictEqual(flashDuration, 5000);
 		tui.stop();
 	});
 

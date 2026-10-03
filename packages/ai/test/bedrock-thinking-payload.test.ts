@@ -1,16 +1,28 @@
 import { describe, expect, it } from "vitest";
 import { type BedrockOptions, stream as streamBedrock } from "../src/api/bedrock-converse-stream.ts";
-import { getModel } from "../src/compat.ts";
+import { getModel, normalizeContext } from "../src/compat.ts";
 import type { Context, Model } from "../src/types.ts";
 import { hasBedrockCredentials } from "./bedrock-utils.ts";
 
 interface BedrockThinkingPayload {
 	additionalModelRequestFields?: {
-		thinking?: { type: string; budget_tokens?: number; display?: string };
+		thinking?: {
+			type: string;
+			budget_tokens?: number;
+			display?: string;
+			block_binding?: { prefix_mismatch_behavior: string };
+		};
 		output_config?: { effort?: string };
 		anthropic_beta?: string[];
 	};
 }
+
+const THINKING_BINDING_CONTROLS_BETA = "thinking-binding-controls-2026-08-01";
+const ADAPTIVE_WITH_BINDING = {
+	type: "adaptive",
+	display: "summarized",
+	block_binding: { prefix_mismatch_behavior: "drop_block" },
+};
 
 class PayloadCaptured extends Error {
 	constructor() {
@@ -30,7 +42,7 @@ async function capturePayload(
 	options?: BedrockOptions,
 ): Promise<BedrockThinkingPayload> {
 	let capturedPayload: BedrockThinkingPayload | undefined;
-	const s = streamBedrock(model, makeContext(), {
+	const s = streamBedrock(model, normalizeContext(makeContext()), {
 		...options,
 		reasoning: options?.reasoning ?? "high",
 		onPayload: (payload) => {
@@ -63,9 +75,9 @@ describe("Bedrock thinking payload", () => {
 
 		const payload = await capturePayload(model);
 
-		expect(payload.additionalModelRequestFields?.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(payload.additionalModelRequestFields?.thinking).toEqual(ADAPTIVE_WITH_BINDING);
 		expect(payload.additionalModelRequestFields?.output_config).toEqual({ effort: "high" });
-		expect(payload.additionalModelRequestFields?.anthropic_beta).toBeUndefined();
+		expect(payload.additionalModelRequestFields?.anthropic_beta).toEqual([THINKING_BINDING_CONTROLS_BETA]);
 	});
 
 	it("maps xhigh reasoning to effort=xhigh for Claude Opus 4.8", async () => {
@@ -78,9 +90,9 @@ describe("Bedrock thinking payload", () => {
 
 		const payload = await capturePayload(model, { reasoning: "xhigh" });
 
-		expect(payload.additionalModelRequestFields?.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(payload.additionalModelRequestFields?.thinking).toEqual(ADAPTIVE_WITH_BINDING);
 		expect(payload.additionalModelRequestFields?.output_config).toEqual({ effort: "xhigh" });
-		expect(payload.additionalModelRequestFields?.anthropic_beta).toBeUndefined();
+		expect(payload.additionalModelRequestFields?.anthropic_beta).toEqual([THINKING_BINDING_CONTROLS_BETA]);
 	});
 
 	it("uses adaptive thinking for Claude Fable 5 when reasoning is enabled", async () => {
@@ -88,9 +100,9 @@ describe("Bedrock thinking payload", () => {
 
 		const payload = await capturePayload(model);
 
-		expect(payload.additionalModelRequestFields?.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(payload.additionalModelRequestFields?.thinking).toEqual(ADAPTIVE_WITH_BINDING);
 		expect(payload.additionalModelRequestFields?.output_config).toEqual({ effort: "high" });
-		expect(payload.additionalModelRequestFields?.anthropic_beta).toBeUndefined();
+		expect(payload.additionalModelRequestFields?.anthropic_beta).toEqual([THINKING_BINDING_CONTROLS_BETA]);
 	});
 
 	it("uses adaptive thinking for Claude Sonnet 5 when reasoning is enabled", async () => {
@@ -98,9 +110,9 @@ describe("Bedrock thinking payload", () => {
 
 		const payload = await capturePayload(model);
 
-		expect(payload.additionalModelRequestFields?.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(payload.additionalModelRequestFields?.thinking).toEqual(ADAPTIVE_WITH_BINDING);
 		expect(payload.additionalModelRequestFields?.output_config).toEqual({ effort: "high" });
-		expect(payload.additionalModelRequestFields?.anthropic_beta).toBeUndefined();
+		expect(payload.additionalModelRequestFields?.anthropic_beta).toEqual([THINKING_BINDING_CONTROLS_BETA]);
 	});
 
 	it("uses adaptive thinking for Claude Opus 5 when reasoning is enabled", async () => {
@@ -108,9 +120,9 @@ describe("Bedrock thinking payload", () => {
 
 		const payload = await capturePayload(model);
 
-		expect(payload.additionalModelRequestFields?.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(payload.additionalModelRequestFields?.thinking).toEqual(ADAPTIVE_WITH_BINDING);
 		expect(payload.additionalModelRequestFields?.output_config).toEqual({ effort: "high" });
-		expect(payload.additionalModelRequestFields?.anthropic_beta).toBeUndefined();
+		expect(payload.additionalModelRequestFields?.anthropic_beta).toEqual([THINKING_BINDING_CONTROLS_BETA]);
 	});
 
 	it("maps xhigh reasoning to effort=xhigh for Claude Opus 5", async () => {
@@ -118,9 +130,9 @@ describe("Bedrock thinking payload", () => {
 
 		const payload = await capturePayload(model, { reasoning: "xhigh" });
 
-		expect(payload.additionalModelRequestFields?.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(payload.additionalModelRequestFields?.thinking).toEqual(ADAPTIVE_WITH_BINDING);
 		expect(payload.additionalModelRequestFields?.output_config).toEqual({ effort: "xhigh" });
-		expect(payload.additionalModelRequestFields?.anthropic_beta).toBeUndefined();
+		expect(payload.additionalModelRequestFields?.anthropic_beta).toEqual([THINKING_BINDING_CONTROLS_BETA]);
 	});
 
 	it("maps xhigh reasoning to effort=xhigh for Claude Fable 5", async () => {
@@ -128,9 +140,32 @@ describe("Bedrock thinking payload", () => {
 
 		const payload = await capturePayload(model, { reasoning: "xhigh" });
 
-		expect(payload.additionalModelRequestFields?.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(payload.additionalModelRequestFields?.thinking).toEqual(ADAPTIVE_WITH_BINDING);
 		expect(payload.additionalModelRequestFields?.output_config).toEqual({ effort: "xhigh" });
 	});
+
+	// https://github.com/earendil-works/pi/issues/10324
+	it("sends block_binding and the binding beta for Claude Opus 5.5", async () => {
+		const model = getModel("amazon-bedrock", "global.anthropic.claude-opus-5-5");
+
+		const payload = await capturePayload(model);
+
+		expect(payload.additionalModelRequestFields?.thinking).toEqual(ADAPTIVE_WITH_BINDING);
+		expect(payload.additionalModelRequestFields?.anthropic_beta).toEqual([THINKING_BINDING_CONTROLS_BETA]);
+	});
+
+	// Bedrock rejects block_binding on 4.6 models: "Extra inputs are not permitted" (#10324)
+	it.each(["global.anthropic.claude-opus-4-6-v1", "global.anthropic.claude-sonnet-4-6"] as const)(
+		"omits block_binding for %s",
+		async (modelId) => {
+			const model = getModel("amazon-bedrock", modelId);
+
+			const payload = await capturePayload(model);
+
+			expect(payload.additionalModelRequestFields?.thinking).toEqual({ type: "adaptive", display: "summarized" });
+			expect(payload.additionalModelRequestFields?.anthropic_beta).toBeUndefined();
+		},
+	);
 
 	it("omits display for GovCloud model ids on non-adaptive Claude thinking", async () => {
 		const baseModel = getModel("amazon-bedrock", "us.anthropic.claude-sonnet-4-5-20250929-v1:0");
@@ -175,7 +210,7 @@ describe.skipIf(!hasBedrockCredentials())("Bedrock Claude max tokens E2E", () =>
 
 			const response = await streamBedrock(
 				model,
-				{
+				normalizeContext({
 					systemPrompt: "You are a deterministic text generator. Follow the requested output format exactly.",
 					messages: [
 						{
@@ -185,7 +220,7 @@ describe.skipIf(!hasBedrockCredentials())("Bedrock Claude max tokens E2E", () =>
 							timestamp: Date.now(),
 						},
 					],
-				},
+				}),
 				{ reasoning: "low" },
 			).result();
 
@@ -221,10 +256,10 @@ describe("Application inference profile support", () => {
 		let capturedPayload: any;
 		const s = streamBedrock(
 			model,
-			{
+			normalizeContext({
 				systemPrompt: "You are helpful.",
 				messages: [{ role: "user", content: "Hello", timestamp: Date.now() }],
-			},
+			}),
 			{
 				onPayload: (payload) => {
 					capturedPayload = payload;

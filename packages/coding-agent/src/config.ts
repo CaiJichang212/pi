@@ -1,4 +1,5 @@
 import { accessSync, constants, existsSync, readFileSync, realpathSync } from "fs";
+import { createRequire } from "module";
 import { homedir } from "os";
 import { basename, dirname, join, resolve, sep, win32 } from "path";
 import { fileURLToPath } from "url";
@@ -172,6 +173,9 @@ function getSelfUpdateCommandForMethod(
 			const [command = "npm", ...npmArgs] = npmCommand ?? [];
 			const inferred = npmCommand?.length ? undefined : getInferredNpmInstall();
 			const prefixArgs = [...npmArgs, ...(inferred ? ["--prefix", inferred.prefix] : [])];
+			// pi.dev advertises releases immediately, so a configured npm age gate would
+			// block the update. npm has no per-package age gate, so this also lets new
+			// transitive dependency releases through. Managed installs avoid this.
 			const installStep = makeSelfUpdateCommandStep(command, [
 				...prefixArgs,
 				"install",
@@ -338,7 +342,7 @@ export function getSelfUpdateUnavailableInstruction(
 	const method = detectInstallMethod();
 	const target = normalizeSelfUpdatePackageTarget(updatePackageTarget);
 	if (method === "bun-binary") {
-		return `Download from: https://github.com/earendil-works/pi-mono/releases/latest`;
+		return `Download from: https://github.com/earendil-works/pi/releases/latest`;
 	}
 	const command = getSelfUpdateCommandForMethod(method, packageName, target, npmCommand);
 	if (command) {
@@ -366,7 +370,7 @@ export function getUpdateInstruction(packageName: string): string {
 /**
  * Get the base directory for resolving package assets (themes, package.json, README.md, CHANGELOG.md).
  * - For Bun binary: returns the directory containing the executable
- * - For Node.js and tsx: returns the package root containing package.json
+ * - For Node.js: returns the package root containing package.json
  * - Ignores Bun binary metadata copied into dist/ when the package root is available
  */
 export function findNodePackageDir(startDir: string): string {
@@ -404,7 +408,7 @@ export function getPackageDir(): string {
  * Get path to built-in themes directory (shipped with package)
  * - For Bun binary: theme/ next to executable
  * - For Node.js (dist/): dist/modes/interactive/theme/
- * - For tsx (src/): src/modes/interactive/theme/
+ * - For source (src/): src/modes/interactive/theme/
  */
 export function getThemesDir(): string {
 	if (isBunBinary) {
@@ -420,7 +424,7 @@ export function getThemesDir(): string {
  * Get path to HTML export template directory (shipped with package)
  * - For Bun binary: export-html/ next to executable
  * - For Node.js (dist/): dist/core/export-html/
- * - For tsx (src/): src/core/export-html/
+ * - For source (src/): src/core/export-html/
  */
 export function getExportTemplateDir(): string {
 	if (isBunBinary) {
@@ -460,7 +464,7 @@ export function getChangelogPath(): string {
  * Get path to built-in interactive assets directory.
  * - For Bun binary: assets/ next to executable
  * - For Node.js (dist/): dist/modes/interactive/assets/
- * - For tsx (src/): src/modes/interactive/assets/
+ * - For source (src/): src/modes/interactive/assets/
  */
 export function getInteractiveAssetsDir(): string {
 	if (isBunBinary) {
@@ -474,6 +478,40 @@ export function getInteractiveAssetsDir(): string {
 /** Get path to a bundled interactive asset */
 export function getBundledInteractiveAssetPath(name: string): string {
 	return join(getInteractiveAssetsDir(), name);
+}
+
+let embeddedQuickJSWasmPath: string | undefined;
+
+/** Called by the Bun entry with the path of the QuickJS wasm file embedded in the compiled executable. */
+export function setEmbeddedQuickJSWasmPath(path: string): void {
+	embeddedQuickJSWasmPath = path;
+}
+
+/** Get path to `quickjs-wasi/quickjs.wasm`, the VM that runs codemode scripts. */
+export function getQuickJSWasmPath(): string {
+	return embeddedQuickJSWasmPath ?? createRequire(import.meta.url).resolve("quickjs-wasi/quickjs.wasm");
+}
+
+/** Resolve the codemode worker entry for a release runtime. */
+export function resolveCodemodeWorkerSpecifier(
+	runtime: "bun-binary" | "bundled-node" | "unbundled",
+	moduleUrl: string,
+): string | URL | undefined {
+	// Bun embeds explicit source entrypoints, but on Windows Bun 1.3 cannot map an absolute
+	// B:\~BUN URL back to one. A relative string with the original source extension works on
+	// every Bun platform.
+	if (runtime === "bun-binary") return "./src/extensions/codemode/worker.ts";
+	if (runtime === "bundled-node") return new URL("./codemode-worker.js", moduleUrl);
+	return undefined;
+}
+
+/**
+ * Get the codemode worker entry, or undefined to use the worker that ships next to pi-codemode.
+ * The Bun and Node release builds both pass the worker as an extra entrypoint.
+ */
+export function getCodemodeWorkerSpecifier(): string | URL | undefined {
+	const runtime = isBunBinary ? "bun-binary" : isBundledNode ? "bundled-node" : "unbundled";
+	return resolveCodemodeWorkerSpecifier(runtime, import.meta.url);
 }
 
 // =============================================================================
